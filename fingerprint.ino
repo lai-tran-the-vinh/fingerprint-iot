@@ -17,8 +17,8 @@ const char WIFI_PASSWORD[] = "motconvitxoera2caicanh";
 const char BASE_URL[] =
   "http://louie-articulative-rema.ngrok-free.dev";
 
-const char DEVICE_CODE[] = "FP001";
-const char DEVICE_SECRET[] = "TrungTinVoDichThienHa";
+const char DEVICE_CODE[] = "FP002";
+const char DEVICE_SECRET[] = "thietbiphongc206";
 
 constexpr int BUTTON_PIN = 13;
 constexpr int FINGER_RX = 4;
@@ -350,8 +350,9 @@ void resetRegistration() {
 }
 
 void handleButton() {
-  static int previousReading = HIGH;
-  static int stableState = HIGH;
+  // INPUT + dien tro pull-down ngoai: tha nut = LOW, nhan nut = HIGH.
+  static int previousReading = LOW;
+  static int stableState = LOW;
   static unsigned long changedAt = 0;
 
   int reading = digitalRead(BUTTON_PIN);
@@ -364,7 +365,7 @@ void handleButton() {
   if (millis() - changedAt >= 40 && reading != stableState) {
     stableState = reading;
 
-    if (stableState == LOW) {
+    if (stableState == HIGH) {
       currentMode = static_cast<Mode>(
         (static_cast<int>(currentMode) + 1) % 3);
 
@@ -953,12 +954,65 @@ bool loadSessionRoster(const String &sessionId) {
   return true;
 }
 
-void findOpenSession() {
-  // Nếu khởi động lại giữa buổi, nạp lại đúng danh sách đang dùng.
-  if (attendanceBatch.sessionId[0]) {
-    loadSessionRoster(String(attendanceBatch.sessionId));
-    return;
+// Thêm code vô đây
+// ================= LUU LICH CA NGAY =================
+
+JsonDocument cachedSessions;
+String cachedDate;
+
+bool dailyScheduleReady = false;
+bool scheduleRequestStarted = false;
+unsigned long lastScheduleRequest = 0;
+
+// Thời gian chờ thử lại khi tải mẫu thất bại.
+bool rosterRetryPending = false;
+unsigned long lastRosterRetry = 0;
+
+// Ngày Việt Nam; đồng hồ hệ thống vẫn giữ UTC.
+String getScheduleDate() {
+  time_t now = time(nullptr);
+
+  if (now < 1700000000) return "";
+
+  time_t vietnamTime = now + 7 * 60 * 60;
+
+  struct tm date = {};
+  gmtime_r(&vietnamTime, &date);
+
+  char buffer[11];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d", &date);
+
+  return String(buffer);
+}
+
+bool ensureDailySchedule() {
+  String today = getScheduleDate();
+
+  if (today.isEmpty()) return false;
+
+  // Đã lấy lịch thành công hôm nay: không gọi server nữa.
+  if (dailyScheduleReady && cachedDate == today) {
+    return true;
   }
+
+  // Sang ngày mới.
+  if (cachedDate != today) {
+    cachedSessions.clear();
+    cachedDate = today;
+
+    dailyScheduleReady = false;
+    scheduleRequestStarted = false;
+    rosterRetryPending = false;
+  }
+
+  // Nếu gọi lỗi, thử lại sau 15 giây.
+  if (
+    scheduleRequestStarted && millis() - lastScheduleRequest < 15000) {
+    return false;
+  }
+
+  scheduleRequestStarted = true;
+  lastScheduleRequest = millis();
 
   JsonDocument request;
   request["timestamp"] = currentTimestamp();
@@ -966,23 +1020,88 @@ void findOpenSession() {
   String body, response;
   serializeJson(request, body);
 
-  int status = callApi("POST", "/attendance/device/sessions", body, response);
+  Serial.printf(
+    "[LICH] Lay lich ngay %s\n",
+    today.c_str());
+
+  int status = callApi(
+    "POST",
+    "/attendance/device/sessions",
+    body,
+    response);
 
   if (status != 200 && status != 201) {
-    showMessage("Loi lay buoi hoc", String(status));
+    Serial.printf("[LICH] Loi HTTP %d\n", status);
+    return false;
+  }
+
+  cachedSessions.clear();
+
+  DeserializationError error =
+    deserializeJson(cachedSessions, response);
+
+  if (
+    error || !cachedSessions["sessions"].is<JsonArray>()) {
+    Serial.println("[LICH] JSON khong hop le");
+    cachedSessions.clear();
+    return false;
+  }
+
+  dailyScheduleReady = true;
+
+  Serial.printf(
+    "[LICH] Da luu %u buoi. Khong goi lai lich dinh ky.\n",
+    (unsigned)cachedSessions["sessions"].as<JsonArray>().size());
+
+  return true;
+}
+
+//
+
+
+
+
+void findOpenSession() {
+  // Có buổi được khôi phục từ NVS: nạp lại đúng buổi đó.
+  if (attendanceBatch.sessionId[0]) {
+    if (rosterLoaded) return;
+
+    if (
+      rosterRetryPending && millis() - lastRosterRetry < 60000) {
+      return;
+    }
+
+    lastRosterRetry = millis();
+
+    bool loaded = loadSessionRoster(
+      String(attendanceBatch.sessionId));
+
+    rosterRetryPending = !loaded;
     return;
   }
 
-  JsonDocument doc;
-  if (deserializeJson(doc, response) || !doc["sessions"].is<JsonArray>()) {
-    showMessage("Loi JSON buoi hoc");
+  if (!ensureDailySchedule()) {
+    showMessage("Chua lay duoc lich", "Dang thu lai");
     return;
   }
 
   time_t now = time(nullptr);
-  bool foundWindow = false;
 
-  for (JsonObject session : doc["sessions"].as<JsonArray>()) {
+  JsonObject selected;
+  time_t selectedOpen = 0;
+  time_t selectedClose = 0;
+  time_t selectedEnd = 0;
+  time_t nextOpen = 0;
+
+  bool waitingForRetry = false;
+
+  for (
+    JsonObject session :
+    cachedSessions["sessions"].as<JsonArray>()) {
+    String id = session["_id"] | "";
+
+    if (id.length() != 24) continue;
+
     const char *startText = session["startTime"] | "";
     const char *openText = session["attendanceOpenTime"];
     const char *closeText = session["attendanceCloseTime"];
@@ -996,31 +1115,113 @@ void findOpenSession() {
     time_t opens = parseUtcTimestamp(String(openText));
     time_t closes = parseUtcTimestamp(String(closeText));
     time_t ends = parseUtcTimestamp(String(endText));
-    String id = session["_id"] | "";
 
-    // Hết điểm danh ở giữa buổi: startTime + (endTime - startTime) / 2.
-    // Thiếu startTime thì dùng endTime.
-    time_t cutoff = (starts && ends > starts) ? starts + (ends - starts) / 2
-                                              : ends;
+    // Giữ nguyên quy tắc kết thúc ở giữa buổi của bạn.
+    time_t cutoff =
+      (starts && ends > starts)
+        ? starts + (ends - starts) / 2
+        : ends;
 
-    if (!opens || !closes || !cutoff || id.length() != 24 || now < opens || now >= cutoff) continue;
+    if (
+      !opens || !closes || !cutoff || cutoff <= opens) {
+      continue;
+    }
 
-    foundWindow = true;
+    // Buổi đã hết thời gian nhận điểm danh.
+    if (now >= cutoff) continue;
 
-    if (!loadSessionRoster(id)) continue;
+    // Buổi chưa mở: nhớ giờ mở gần nhất.
+    if (now < opens) {
+      if (!nextOpen || opens < nextOpen) {
+        nextOpen = opens;
+      }
+      continue;
+    }
 
-    id.toCharArray(attendanceBatch.sessionId, sizeof(attendanceBatch.sessionId));
-    attendanceBatch.closesAt = closes;
-    attendanceBatch.endsAt = cutoff;
+    // Mỗi buổi tải mẫu lỗi được thử lại sau 60 giây.
+    // Đây không phải gọi lại API lấy lịch.
+    int64_t retryAt =
+      session["_retryAt"] | (int64_t)0;
+
+    if (retryAt > (int64_t)now) {
+      waitingForRetry = true;
+      continue;
+    }
+
+    // Không phụ thuộc thứ tự danh sách server trả về.
+    if (selected.isNull() || opens < selectedOpen) {
+      selected = session;
+      selectedOpen = opens;
+      selectedClose = closes;
+      selectedEnd = cutoff;
+    }
+  }
+
+  if (selected.isNull()) {
+    // Không ghi đè lỗi nạp mẫu trong thời gian chờ thử lại.
+    if (waitingForRetry) return;
+
+    if (nextOpen) {
+      time_t vietnamTime = nextOpen + 7 * 60 * 60;
+
+      struct tm clock = {};
+      gmtime_r(&vietnamTime, &clock);
+
+      char text[17];
+      strftime(
+        text,
+        sizeof(text),
+        "Mo luc %H:%M",
+        &clock);
+
+      showMessage("Cho buoi ke tiep", String(text));
+    } else {
+      showMessage("Khong con buoi", "trong lich da lay");
+    }
+
     return;
   }
 
-  if (!foundWindow) {
-    showMessage("DIEM DANH", "Chua den gio");
-  } else {
-    showMessage("Chua tai duoc mau", "Xem Serial");
+  String id = selected["_id"].as<String>();
+
+  Serial.printf(
+    "[LICH] Den gio buoi %s. Bat dau tai mau.\n",
+    id.c_str());
+
+  if (!loadSessionRoster(id)) {
+    selected["_retryAt"] = (int64_t)time(nullptr) + 60;
+
+    Serial.printf(
+      "[MAU] Buoi %s tai loi. Thu lai sau 60 giay.\n",
+      id.c_str());
+
+    // Giữ nguyên thông báo lỗi của loadSessionRoster().
+    return;
   }
+
+  // Kiểm tra lại vì nạp mẫu có thể mất thời gian.
+  if (time(nullptr) >= selectedEnd) {
+    clearRoster();
+    showMessage("Buoi da het gio", "Cho buoi tiep");
+    return;
+  }
+
+  id.toCharArray(
+    attendanceBatch.sessionId,
+    sizeof(attendanceBatch.sessionId));
+
+  attendanceBatch.closesAt = selectedClose;
+  attendanceBatch.endsAt = selectedEnd;
+
+  rosterRetryPending = false;
+
+  Serial.printf(
+    "[LICH] San sang diem danh. Ket thuc UTC: %s\n",
+    scanTimestamp(selectedEnd).c_str());
 }
+
+
+
 
 void scanAttendanceFinger() {
   if (millis() - lastFingerRead < 150) return;
@@ -1243,7 +1444,7 @@ void handleAttendance() {
   }
 
   if (!rosterLoaded) {
-    if (millis() - lastAttendancePoll < 60000) return;
+    if (millis() - lastAttendancePoll < 1000) return;
     lastAttendancePoll = millis();
     findOpenSession();
     return;
@@ -1256,16 +1457,34 @@ void handleAttendance() {
 void refreshSession() {
   if (!sensorReady || !restoreAttendanceBatch()) return;
 
-  if (attendanceBatch.sessionId[0] && time(nullptr) >= attendanceBatch.endsAt) {
+  if (
+    attendanceBatch.sessionId[0] &&
+    time(nullptr) >= attendanceBatch.endsAt
+  ) {
     finishAttendanceSession();
     return;
   }
 
+  rosterRetryPending = false;
+
   if (attendanceBatch.sessionId[0]) {
-    loadSessionRoster(String(attendanceBatch.sessionId));
-  } else {
-    findOpenSession();
+    bool loaded = loadSessionRoster(
+      String(attendanceBatch.sessionId)
+    );
+
+    rosterRetryPending = !loaded;
+    lastRosterRetry = millis();
+    return;
   }
+
+  // SESSION / TEMPLATES khi chưa có buổi:
+  // yêu cầu tải lại lịch sau khi sửa lịch trên web.
+  cachedSessions.clear();
+  dailyScheduleReady = false;
+  scheduleRequestStarted = false;
+
+  lastAttendancePoll = millis() - 1000;
+  findOpenSession();
 }
 
 // ================= LỆNH SERIAL =================
@@ -1332,7 +1551,7 @@ void handleSerial() {
 void setup() {
   Serial.begin(115200);
 
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_PIN, INPUT);  // Dung dien tro pull-down 10k ngoai
 
   Wire.begin(21, 22);
   lcd.init();
@@ -1427,6 +1646,12 @@ void loop() {
     delay(10);
     return;
   }
+
+
+  // Lấy lịch ngay khi máy có mạng và giờ chuẩn,
+  // kể cả lúc đang ở chế độ đăng ký.
+  // Nếu đã lấy thành công hôm nay, hàm trả về ngay.
+  ensureDailySchedule();
 
   if (currentMode == REGISTER_MODE) {
     if (
