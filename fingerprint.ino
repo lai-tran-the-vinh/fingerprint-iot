@@ -21,6 +21,13 @@ const char DEVICE_CODE[] = "FP002";
 const char DEVICE_SECRET[] = "thietbiphongc206";
 
 constexpr int BUTTON_PIN = 13;
+
+constexpr int BUZZER_PIN = 19;
+
+// Nếu còi kêu ngược (bình thường kêu, báo thì im),
+// đổi HIGH thành LOW.
+constexpr uint8_t BUZZER_ACTIVE_LEVEL = LOW;
+
 constexpr int FINGER_RX = 4;
 constexpr int FINGER_TX = 5;
 
@@ -70,12 +77,51 @@ unsigned long lastSensorPoll = 0;
 unsigned long lastAttendancePoll = 0;
 unsigned long lastWiFiAttempt = 0;
 
-// ================= LCD =================
 
+
+
+
+// Mỗi tiếng kêu 80 ms, khoảng nghỉ giữa hai tiếng 100 ms.
+bool buzzerEnabled = false;
+
+void silenceBuzzer() {
+  // Còi kích LOW nên HIGH là tắt.
+  digitalWrite(
+    BUZZER_PIN,
+    BUZZER_ACTIVE_LEVEL == LOW ? HIGH : LOW);
+}
+
+void beep(uint8_t count) {
+  if (!buzzerEnabled) {
+    silenceBuzzer();
+    return;
+  }
+
+  for (uint8_t i = 0; i < count; i++) {
+    digitalWrite(BUZZER_PIN, BUZZER_ACTIVE_LEVEL);
+    delay(80);
+
+    silenceBuzzer();
+
+    if (i + 1 < count) {
+      delay(100);
+    }
+  }
+}
+
+// Chỉ báo các lỗi xử lý.
+// Không báo lỗi khi đang chờ Wi-Fi, chờ lịch hoặc chưa có lượt đăng ký.
+bool isErrorMessage(const String &message) {
+  return message.startsWith("Loi ") || message.startsWith("Thieu ") || message == "Khong xuat mau" || message == "Khong nhan ra" || message == "Khong co trong" || message == "Mau bi trung" || message == "Day bo nho" || message == "Chua gui duoc" || message == "Chua gui ket qua" || message == "Chua tai duoc mau" || message == "Chua co mau dung" || message == "Buoi khong co mau" || message == "Server tu choi" || message == "Server chua nhan" || message == "Hang doi loi" || message == "Response khac" || message == "Luot da het han" || message == "Het gio diem danh" || message == "Chua cau hinh";
+}
+
+
+// ================= LCD =================
 void showMessage(String line1, String line2 = "") {
   static String previous1;
   static String previous2;
 
+  // Thông báo không đổi thì không cập nhật LCD và không kêu lại.
   if (line1 == previous1 && line2 == previous2) {
     return;
   }
@@ -84,12 +130,22 @@ void showMessage(String line1, String line2 = "") {
   previous2 = line2;
 
   lcd.clear();
+
   lcd.setCursor(0, 0);
   lcd.print(line1.substring(0, 16));
+
   lcd.setCursor(0, 1);
   lcd.print(line2.substring(0, 16));
 
   Serial.println(line1 + " | " + line2);
+
+  // Đăng ký được server xác nhận hoặc đã lưu lượt điểm danh.
+  if (
+    line1 == "Dang ky server OK" || line1 == "Diem danh OK" || line1 == "Diem danh TRE" || line1 == "Da gui diem danh") {
+    beep(2);
+  } else if (isErrorMessage(line1)) {
+    beep(3);
+  }
 }
 
 void showMode() {
@@ -377,6 +433,7 @@ void handleButton() {
       lastAttendancePoll = millis() - 60000;
 
       showMode();
+      beep(1);
     }
   }
 }
@@ -1458,9 +1515,7 @@ void refreshSession() {
   if (!sensorReady || !restoreAttendanceBatch()) return;
 
   if (
-    attendanceBatch.sessionId[0] &&
-    time(nullptr) >= attendanceBatch.endsAt
-  ) {
+    attendanceBatch.sessionId[0] && time(nullptr) >= attendanceBatch.endsAt) {
     finishAttendanceSession();
     return;
   }
@@ -1469,8 +1524,7 @@ void refreshSession() {
 
   if (attendanceBatch.sessionId[0]) {
     bool loaded = loadSessionRoster(
-      String(attendanceBatch.sessionId)
-    );
+      String(attendanceBatch.sessionId));
 
     rosterRetryPending = !loaded;
     lastRosterRetry = millis();
@@ -1549,6 +1603,13 @@ void handleSerial() {
 // ================= SETUP =================
 
 void setup() {
+  buzzerEnabled = false;
+
+  // Đặt mức tắt trước khi bật chế độ OUTPUT.
+  silenceBuzzer();
+  pinMode(BUZZER_PIN, OUTPUT);
+  silenceBuzzer();
+
   Serial.begin(115200);
 
   pinMode(BUTTON_PIN, INPUT);  // Dung dien tro pull-down 10k ngoai
@@ -1603,6 +1664,14 @@ void setup() {
 // ================= LOOP =================
 
 void loop() {
+
+  // Chỉ cho còi hoạt động khi đã có Wi-Fi và giờ chuẩn.
+  buzzerEnabled =
+    WiFi.status() == WL_CONNECTED && !currentTimestamp().isEmpty();
+
+  if (!buzzerEnabled) {
+    silenceBuzzer();
+  }
   handleButton();
 
   // Tắt logic xử lý, vẫn đọc nút để bật lại.
